@@ -1,0 +1,176 @@
+# =====================================
+# Python
+# =====================================
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual Environment
+venv/
+.venv/
+env/
+ENV/
+
+# Python Distribution
+build/
+dist/
+*.egg-info/
+.eggs/
+*.egg
+
+# Logs
+*.log
+logs/
+*.out
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+output
+
+# Jupyter
+.ipynb_checkpoints/
+
+# =====================================
+# VS Code / IDE
+# =====================================
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# =====================================
+# OS Files
+# =====================================
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# =====================================
+# Environment Variables
+# =====================================
+.env
+.env.*
+!.env.example
+
+# =====================================
+# Secrets / Keys
+# =====================================
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+credentials.json
+service_account.json
+client_secret*.json
+
+# =====================================
+# Database
+# =====================================
+*.db
+*.sqlite
+*.sqlite3
+
+# =====================================
+# Cache
+# =====================================
+.cache/
+.cache-loader/
+*.cache
+
+# =====================================
+# Audio / Video Output
+# =====================================
+outputs/
+generated/
+downloads/
+temp/
+tmp/
+
+# =====================================
+# AI Models (DO NOT PUSH)
+# =====================================
+newsbot/assets/models/
+
+# OR if you want to keep the folder:
+# newsbot/assets/models/*
+# !newsbot/assets/models/.gitkeep
+# !newsbot/assets/models/README.md
+
+# Large AI files
+*.onnx
+*.bin
+*.gguf
+*.ggml
+*.pth
+*.pt
+*.ckpt
+*.safetensors
+*.tflite
+*.engine
+*.pb
+*.weights
+*.lock
+
+# =====================================
+# HuggingFace / Torch Cache
+# =====================================
+.huggingface/
+.cache/huggingface/
+.cache/torch/
+torch_cache/
+
+# =====================================
+# Node (if frontend exists)
+# =====================================
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# =====================================
+# Build Files
+# =====================================
+build/
+dist/
+coverage/
+
+# =====================================
+# Telegram Session Files
+# =====================================
+*.session
+*.session-journal
+
+# =====================================
+# Media
+# =====================================
+*.mp4
+*.mov
+*.avi
+*.mkv
+*.wav
+*.mp3
+
+# Keep sample media if needed
+!sample.mp4
+
+# =====================================
+# Archives
+# =====================================
+*.zip
+*.rar
+*.7z
+*.tar
+*.gz
+
+# =====================================
+# Misc
+# =====================================
+*.bak
+*.tmp
+*.old

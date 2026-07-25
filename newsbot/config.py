@@ -66,3 +66,4 @@ class Config:
             OUTPUT_DIR=output_dir,
             ASSETS_DIR=assets_dir,
         )
+        
