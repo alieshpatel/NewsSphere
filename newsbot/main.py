@@ -149,6 +149,16 @@ async def run_pipeline() -> None:
     logger.info(f"Script generated — {len(script.get('segments', []))} segments, "
                 f"~{len(script.get('full_script', '').split())} words.")
 
+    script = await script_agent.write_script(selected_story)
+    logger.info(f"Script generated — {len(script.get('segments', []))} segments, "
+                f"~{len(script.get('full_script', '').split())} words.")
+
+    # Persist for crash recovery
+    import json
+    (temp_dir / "script.json").write_text(json.dumps(script, indent=2, ensure_ascii=False))
+    (temp_dir / "story.json").write_text(json.dumps(selected_story, indent=2, ensure_ascii=False))
+    (temp_dir / "headline.txt").write_text(headline)
+    
     # ── 5. Parallel: Voiceover + Thumbnail ──────────────────────────────
     logger.info("Step 5/13: Generating voiceover + thumbnail in parallel...")
     voice_agent = VoiceAgent(config)

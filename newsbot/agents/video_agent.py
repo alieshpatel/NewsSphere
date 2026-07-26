@@ -141,59 +141,42 @@ class VideoAgent:
 
             final_clips = []
             
-            # 3. Intro
+           # 3. Intro
             intro_path = self.config.ASSETS_DIR / "intro.mp4"
             if intro_path.exists():
                 intro_clip = VideoFileClip(str(intro_path))
                 clips_to_close.append(intro_clip)
-                final_clips.append(intro_clip)
-                # Need to resize?
                 if intro_clip.w != 1920 or intro_clip.h != 1080:
                     intro_clip = intro_clip.resized(new_size=(1920, 1080))
-            
+                final_clips.append(intro_clip)
+
             # 4. Script segments
             segments = script.get("segments", [])
-            # Fake logic for segment duration: distribute evenly if not specified
             segment_duration = total_duration / len(segments) if segments else 0
-            
+
             broll_index = 0
             segment_clips = []
-            
+
             for i, segment in enumerate(segments):
                 seg_name = segment.get("name", f"Segment {i+1}")
                 dur = segment.get("duration", segment_duration)
-                
+
                 if broll_paths:
                     broll = broll_paths[broll_index % len(broll_paths)]
                     broll_index += 1
                     clip = VideoFileClip(str(broll))
                     clips_to_close.append(clip)
                 else:
-                    clip = ColorClip(size=(1920, 1080), color=(0,0,0), duration=dur)
+                    clip = ColorClip(size=(1920, 1080), color=(0, 0, 0), duration=dur)
                     clips_to_close.append(clip)
-                
-                # Loop/trim and resize
-                def _loop_clip_to_duration(self, clip, target_duration: float):
-                 """Loop or trim a clip to exactly target_duration (MoviePy 2.x)."""
 
-                # Trim if clip is longer
-                if clip.duration >= target_duration:
-                    return clip.subclipped(0, target_duration)
+                # Loop/trim to the segment's target duration, then resize
+                clip = self._loop_clip_to_duration(clip, dur)
+                if clip.w != 1920 or clip.h != 1080:
+                    clip = clip.resized(new_size=(1920, 1080))
 
-                # Otherwise repeat the clip until long enough
-                    loops = []
-                    remaining = target_duration
+                segment_clips.append(clip)
 
-                while remaining > 0:
-                    if remaining >= clip.duration:
-                        loops.append(clip)
-                        remaining -= clip.duration
-                    else:
-                        loops.append(clip.subclipped(0, remaining))
-                        remaining = 0
-
-                return concatenate_videoclips(loops, method="compose")
-    
             # 5. Outro
             outro_path = self.config.ASSETS_DIR / "outro.mp4"
             outro_clip_obj = None
@@ -201,7 +184,7 @@ class VideoAgent:
                 outro_clip_obj = VideoFileClip(str(outro_path))
                 clips_to_close.append(outro_clip_obj)
                 if outro_clip_obj.w != 1920 or outro_clip_obj.h != 1080:
-                    outro_clip_obj = outro_clip_obj.resized(newsize=(1920, 1080))
+                    outro_clip_obj = outro_clip_obj.resized(new_size=(1920, 1080))
             
             # Combine segments
             if segment_clips:
@@ -220,14 +203,13 @@ class VideoAgent:
             if music_path and music_path.exists():
                 bg_music = AudioFileClip(str(music_path))
                 clips_to_close.append(bg_music)
+
                 # Loop music to match full video length
-                if hasattr(afx, "audio_loop"):
-                    bg_music = bg_music.fx(afx.audio_loop, duration=full_video.duration)
-                else:
-                    bg_music = bg_music.with_duration(full_video.duration)
-                
-                bg_music = bg_music.volumex(self.config.MUSIC_VOLUME)
-                
+                bg_music = bg_music.with_effects([afx.AudioLoop(duration=full_video.duration)])
+
+                # Scale volume (replaces v1 volumex)
+                bg_music = bg_music.with_effects([afx.MultiplyVolume(self.config.MUSIC_VOLUME)])
+
                 mixed_audio = CompositeAudioClip([full_video.audio, bg_music])
                 full_video = full_video.with_audio(mixed_audio)
             
@@ -298,64 +280,70 @@ class VideoAgent:
         bg = bg.with_duration(duration).with_position((0, bar_y))
         
         # Text
+        font_path = r"C:\Windows\Fonts\arialbd.ttf"
         try:
-            txt = TextClip(text, fontsize=60, color='white', font='Arial-Bold', align='West')
+            txt = TextClip(font=font_path, text=text, font_size=60, color='white', horizontal_align='left')
         except Exception:
-            txt = TextClip(text, fontsize=60, color='white')
+            txt = TextClip(font=font_path, text=text, font_size=60, color='white')
             
         txt = txt.with_duration(duration).with_position((50, bar_y + (bar_height - txt.h) // 2))
         
         return CompositeVideoClip([bg, txt], size=video_size).with_duration(duration)
 
     def _loop_clip_to_duration(self, clip, target_duration: float):
-        """Loop a video clip to fill target_duration."""
+        """Loop or trim a clip to exactly target_duration (MoviePy 2.x)."""
         if clip.duration >= target_duration:
-            return clip.subclip(0, target_duration)
-        else:
-            if hasattr(vfx, "loop"):
-                return clip.fx(vfx.loop, duration=target_duration)
+            return clip.subclipped(0, target_duration)
+
+        loops = []
+        remaining = target_duration
+        while remaining > 0:
+            if remaining >= clip.duration:
+                loops.append(clip)
+                remaining -= clip.duration
             else:
-                # fallback loop
-                n_loops = int(target_duration / clip.duration) + 1
-                clips = [clip] * n_loops
-                concat = concatenate_videoclips(clips)
-                return concat.subclip(0, target_duration)
+                loops.append(clip.subclipped(0, remaining))
+                remaining = 0
+
+        return concatenate_videoclips(loops, method="compose")
 
     def _burn_captions(self, video, srt_path: Path):
         """Parse SRT file and burn captions onto video."""
         captions = self._parse_srt(srt_path)
         if not captions:
             return video
-            
+
         w, h = video.w, video.h
-        
+        font_path = r"C:\Windows\Fonts\arialbd.ttf"
+
         text_clips = []
         for cap in captions:
             start_t = self._srt_time_to_seconds(cap["start"])
             end_t = self._srt_time_to_seconds(cap["end"])
             duration = end_t - start_t
-            
+
             if duration <= 0:
                 continue
-                
+
             try:
                 txt = TextClip(
-                    cap["text"], 
-                    fontsize=48, 
+                    font=font_path,
+                    text=cap["text"],
+                    font_size=48,
                     color='white',
                     stroke_color='black',
                     stroke_width=2,
                     method='caption',
                     size=(int(w * 0.8), None),
-                    align='center'
+                    text_align='center',
                 )
-            except Exception:
-                # Fallback if specific kwargs fail
-                txt = TextClip(cap["text"], fontsize=48, color='white')
-                
+            except Exception as e:
+                logger.warning(f"TextClip styled render failed ({e}), falling back to plain text")
+                txt = TextClip(font=font_path, text=cap["text"], font_size=48, color='white')
+
             txt = txt.with_duration(duration).with_position(('center', h * 0.85)).with_start(start_t)
             text_clips.append(txt)
-            
+
         return CompositeVideoClip([video] + text_clips)
 
     def _parse_srt(self, srt_path: Path) -> List[Dict]:
