@@ -5,6 +5,7 @@ import re
 from pathlib import Path
 import os
 import concurrent.futures
+from utils.progress import ProgressBar
 from typing import List, Optional, Dict, Tuple
 
 try:
@@ -31,97 +32,130 @@ class VideoAgent:
         self.config = config
         self.pexels_headers = {"Authorization": config.PEXELS_API_KEY}
     
-    async def fetch_broll(self, keywords: List[str], temp_dir: Path) -> List[Path]:
-        """
-        For each keyword:
-        1. GET https://api.pexels.com/videos/search?query={keyword}&per_page=3&min_duration=5&max_duration=30&orientation=landscape
-        2. From results, pick videos with resolution >= 1920x1080 (or best available)
-        3. Download the HD video file to temp_dir/{keyword_slug}_{index}.mp4
-        4. Use aiohttp for async downloads with progress logging
-        5. Add 0.5s delay between API requests to respect 200/hour limit
-        6. Return list of downloaded video paths
-        7. If a keyword returns no results, log warning and skip
-        8. Handle network errors gracefully
-        Max downloads: config.MAX_BROLL_PER_KEYWORD per keyword
-        """
+        async def fetch_broll(self, keywords: List[str], temp_dir: Path) -> List[Path]:
+            """
+            Fetch b-roll for all keywords CONCURRENTLY instead of sequentially.
+            A semaphore caps how many keyword-searches run in parallel, so we
+            respect Pexels' rate limit while still cutting total wall-clock time
+            dramatically versus doing one keyword at a time.
+            """
         temp_dir.mkdir(parents=True, exist_ok=True)
-        downloaded_paths = []
+
+        # Tune this: higher = faster, but more simultaneous connections/requests.
+        # 4-5 concurrent keyword searches is a safe, fast default for Pexels' free tier.
+        MAX_CONCURRENT_KEYWORDS = 5
+        semaphore = asyncio.Semaphore(MAX_CONCURRENT_KEYWORDS)
+
+        overall = ProgressBar(
+            total=len(keywords) * self.config.MAX_BROLL_PER_KEYWORD,
+            label="B-roll clips",
+            unit="clips",
+        )
 
         async with aiohttp.ClientSession(headers=self.pexels_headers) as session:
-            for keyword in keywords:
-                keyword_slug = re.sub(r'[^a-z0-9]+', '_', keyword.lower()).strip('_')
-                if not keyword_slug:
-                    continue
 
-                url = f"https://api.pexels.com/videos/search?query={keyword}&per_page=15&min_duration=5&max_duration=30&orientation=landscape"
-                
-                try:
-                    logger.info(f"Searching Pexels for b-roll: '{keyword}'")
-                    async with session.get(url) as response:
-                        if response.status != 200:
-                            logger.error(f"Pexels API error for '{keyword}': {response.status}")
-                            continue
-                        
-                        data = await response.json()
-                except Exception as e:
-                    logger.error(f"Network error fetching b-roll metadata for '{keyword}': {e}")
-                    continue
-                
-                videos = data.get("videos", [])
-                if not videos:
-                    logger.warning(f"No b-roll found for keyword '{keyword}'")
-                    continue
-                
-                download_count = 0
-                for video in videos:
-                    if download_count >= self.config.MAX_BROLL_PER_KEYWORD:
-                        break
-                    
-                    video_files = video.get("video_files", [])
-                    if not video_files:
-                        continue
-                    
-                    # Sort by resolution to get highest first
-                    video_files = sorted(
-                        video_files, 
-                        key=lambda x: (x.get("width", 0) * x.get("height", 0)), 
-                        reverse=True
+            async def _process_keyword(keyword: str) -> List[Path]:
+                async with semaphore:
+                    return await self._fetch_broll_for_keyword(
+                        session, keyword, temp_dir, overall
                     )
-                    
-                    # Pick best file (at least 1920x1080 if available, else highest)
-                    best_file = video_files[0]
-                    for vf in video_files:
-                        if vf.get("width", 0) >= 1920 and vf.get("height", 0) >= 1080:
-                            best_file = vf
-                            break
-                    
-                    download_link = best_file.get("link")
-                    if not download_link:
-                        continue
-                    
-                    dest_path = temp_dir / f"{keyword_slug}_{download_count}.mp4"
-                    
-                    try:
-                        logger.info(f"Downloading b-roll {dest_path.name}")
-                        async with session.get(download_link) as dl_resp:
-                            if dl_resp.status == 200:
-                                with open(dest_path, 'wb') as f:
-                                    while True:
-                                        chunk = await dl_resp.content.read(8192)
-                                        if not chunk:
-                                            break
-                                        f.write(chunk)
-                                downloaded_paths.append(dest_path)
-                                download_count += 1
-                            else:
-                                logger.error(f"Failed to download video file: {dl_resp.status}")
-                    except Exception as e:
-                        logger.error(f"Error downloading video {download_link}: {e}")
-                
-                # Rate limit delay
-                await asyncio.sleep(0.5)
 
+            # Launch all keyword searches at once; semaphore throttles actual concurrency
+            results = await asyncio.gather(
+                *[_process_keyword(kw) for kw in keywords],
+                return_exceptions=True,
+            )
+
+        downloaded_paths: List[Path] = []
+        for keyword, result in zip(keywords, results):
+            if isinstance(result, Exception):
+                logger.error(f"B-roll fetch failed entirely for '{keyword}': {result}")
+                continue
+            downloaded_paths.extend(result)
+
+        overall.finish(f"{len(downloaded_paths)} b-roll clips downloaded")
         return downloaded_paths
+
+
+    async def _fetch_broll_for_keyword(
+        self,
+        session: aiohttp.ClientSession,
+        keyword: str,
+        temp_dir: Path,
+        overall: "ProgressBar",
+    ) -> List[Path]:
+        """Search + download b-roll for a single keyword. Runs concurrently across keywords."""
+        keyword_slug = re.sub(r'[^a-z0-9]+', '_', keyword.lower()).strip('_')
+        if not keyword_slug:
+            return []
+
+
+        best_file = self._select_best_broll_file(video_files)
+        if not best_file:
+            link = best_file.get("link")
+
+        try:
+            logger.info(f"Searching Pexels for b-roll: '{keyword}'")
+            async with session.get(url) as response:
+                if response.status != 200:
+                    logger.error(f"Pexels API error for '{keyword}': {response.status}")
+                    return []
+                data = await response.json()
+        except Exception as e:
+            logger.error(f"Network error fetching b-roll metadata for '{keyword}': {e}")
+            return []
+
+        videos = data.get("videos", [])
+        if not videos:
+            logger.warning(f"No b-roll found for keyword '{keyword}'")
+            return []
+
+        downloaded: List[Path] = []
+        download_count = 0
+
+        for video in videos:
+            if download_count >= self.config.MAX_BROLL_PER_KEYWORD:
+                break
+
+            video_files = video.get("video_files", [])
+            if not video_files:
+                continue
+
+            video_files = sorted(
+                video_files,
+                key=lambda x: (x.get("width", 0) * x.get("height", 0)),
+                reverse=True,
+            )
+            best_file = video_files[0]
+            for vf in video_files:
+                if vf.get("width", 0) >= 1920 and vf.get("height", 0) >= 1080:
+                    best_file = vf
+                    break
+
+            download_link = best_file.get("link")
+            if not download_link:
+                continue
+
+            dest_path = temp_dir / f"{keyword_slug}_{download_count}.mp4"
+
+            try:
+                async with session.get(download_link) as dl_resp:
+                    if dl_resp.status == 200:
+                        with open(dest_path, 'wb') as f:
+                            while True:
+                                chunk = await dl_resp.content.read(65536)
+                                if not chunk:
+                                    break
+                                f.write(chunk)
+                        downloaded.append(dest_path)
+                        download_count += 1
+                        overall.update(1)
+                    else:
+                        logger.error(f"Failed to download video file: {dl_resp.status}")
+            except Exception as e:
+                logger.error(f"Error downloading video {download_link}: {e}")
+
+        return downloaded
 
     def _assemble_video_sync(
         self,
@@ -170,10 +204,9 @@ class VideoAgent:
                     clip = ColorClip(size=(1920, 1080), color=(0, 0, 0), duration=dur)
                     clips_to_close.append(clip)
 
-                # Loop/trim to the segment's target duration, then resize
+                # Loop/trim to the segment's target duration, then force exact 1080p
                 clip = self._loop_clip_to_duration(clip, dur)
-                if clip.w != 1920 or clip.h != 1080:
-                    clip = clip.resized(new_size=(1920, 1080))
+                clip = self._force_1080p(clip)
 
                 segment_clips.append(clip)
 
@@ -224,9 +257,9 @@ class VideoAgent:
                 fps=self.config.VIDEO_FPS,
                 codec="libx264",
                 audio_codec="aac",
-                preset="fast",
-                threads=4,
-                logger=None
+                preset="veryfast",
+                threads=os.cpu_count(),
+                logger="bar"
             )
             
             # 11. Log output size

@@ -21,6 +21,7 @@ from agents.thumbnail_agent import ThumbnailAgent
 from agents.caption_agent import CaptionAgent
 from agents.seo_agent import SEOAgent
 from agents.publisher_agent import PublisherAgent
+from utils.progress import StepSpinner
 from utils.telegram_notify import TelegramNotifier
 from utils.file_manager import FileManager
 from utils.rate_limiter import RateLimiter
@@ -145,32 +146,28 @@ async def run_pipeline() -> None:
     # ── 4. Write script ─────────────────────────────────────────────────
     logger.info("Step 4/13: Writing video script with Gemini 2.5 Flash...")
     script_agent = ScriptAgent(config)
-    script = await script_agent.write_script(selected_story)
-    logger.info(f"Script generated — {len(script.get('segments', []))} segments, "
-                f"~{len(script.get('full_script', '').split())} words.")
-
-    script = await script_agent.write_script(selected_story)
-    logger.info(f"Script generated — {len(script.get('segments', []))} segments, "
-                f"~{len(script.get('full_script', '').split())} words.")
+    async with StepSpinner(4, 13, "Writing video script (Gemini)", pipeline_start):
+        script = await script_agent.write_script(selected_story)
+    logger.info(f"Script generated — {len(script.get('segments', []))} segments.")
 
     # Persist for crash recovery
     import json
     (temp_dir / "script.json").write_text(json.dumps(script, indent=2, ensure_ascii=False))
     (temp_dir / "story.json").write_text(json.dumps(selected_story, indent=2, ensure_ascii=False))
     (temp_dir / "headline.txt").write_text(headline)
-    
+
     # ── 5. Parallel: Voiceover + Thumbnail ──────────────────────────────
     logger.info("Step 5/13: Generating voiceover + thumbnail in parallel...")
     voice_agent = VoiceAgent(config)
     thumb_agent = ThumbnailAgent(config)
-
     voiceover_path = file_mgr.generate_output_path(headline, "voiceover", "wav")
     thumbnail_path = file_mgr.generate_output_path(headline, "thumbnail", "jpg")
 
-    voice_result, thumbnail_result = await asyncio.gather(
-        voice_agent.generate_voiceover(script, voiceover_path),
-        thumb_agent.create_thumbnail(script, selected_story, thumbnail_path),
-    )
+    async with StepSpinner(5, 13, "Voiceover + thumbnail (parallel)", pipeline_start):
+        voice_result, thumbnail_result = await asyncio.gather(
+            voice_agent.generate_voiceover(script, voiceover_path),
+            thumb_agent.create_thumbnail(script, selected_story, thumbnail_path),
+        )
 
     audio_path = voice_result["audio_path"]
     audio_duration = voice_result["duration_seconds"]
@@ -182,16 +179,36 @@ async def run_pipeline() -> None:
     logger.info("Step 6/13: Generating captions with Whisper...")
     caption_agent = CaptionAgent(config)
     captions_srt_path = temp_dir / "captions.srt"
-    caption_result = await caption_agent.generate_captions(audio_path, captions_srt_path)
+    async with StepSpinner(6, 13, "Generating captions (Whisper)", pipeline_start):
+        caption_result = await caption_agent.generate_captions(audio_path, captions_srt_path)
+
     logger.info(f"Captions: {caption_result['segment_count']} segments, "
                 f"{caption_result['word_count']} words.")
 
     # ── 7. Fetch b-roll + assemble video ────────────────────────────────
     logger.info("Step 7/13: Fetching b-roll from Pexels + assembling video...")
+    # ── 7. Assemble video (b-roll fetch has its own bars already) ──────
     video_agent = VideoAgent(config)
-
     broll_keywords = script.get("broll_keywords", [])
-    broll_paths = await video_agent.fetch_broll(broll_keywords, temp_dir / "broll")
+    broll_paths = await video_agent.fetch_broll(broll_keywords)  # now returns URLs, not file paths
+
+    music_path = file_mgr.get_music_file()
+    if music_path:
+        logger.info(f"Background music: {music_path.name}")
+    else:
+        logger.info("No background music found in assets/music/ — skipping.")
+
+    main_video_path = file_mgr.generate_output_path(headline, "main", "mp4")
+    async with StepSpinner(7, 13, "Assembling final video (MoviePy)", pipeline_start):
+        await video_agent.assemble_video(
+            voiceover_path=audio_path,
+            broll_paths=broll_paths,
+            script=script,
+            captions_srt=captions_srt_path,
+            output_path=main_video_path,
+            music_path=music_path,
+        )
+        
     logger.info(f"Downloaded {len(broll_paths)} b-roll clips.")
 
     music_path = file_mgr.get_music_file()
@@ -215,14 +232,16 @@ async def run_pipeline() -> None:
     # ── 8. Cut Shorts clip ──────────────────────────────────────────────
     logger.info("Step 8/13: Cutting YouTube Shorts clip (1080x1920)...")
     shorts_path = file_mgr.generate_output_path(headline, "shorts", "mp4")
-    await caption_agent.cut_shorts_clip(main_video_path, script, shorts_path)
+    async with StepSpinner(8, 13, "Cutting YouTube Shorts clip (1080x1920)", pipeline_start):
+        await caption_agent.cut_shorts_clip(main_video_path, script, shorts_path)
     logger.info(f"Shorts clip: {shorts_path.name}")
     file_mgr.log_file_size(shorts_path)
 
     # ── 9. Generate SEO metadata ────────────────────────────────────────
     logger.info("Step 9/13: Generating SEO metadata with Gemini 2.5 Flash...")
     seo_agent = SEOAgent(config)
-    metadata = await seo_agent.generate_metadata(script, selected_story)
+    async with StepSpinner(9, 13, "Generating SEO metadata (Gemini)", pipeline_start):
+        metadata = await seo_agent.generate_metadata(script, selected_story)
     logger.info(f"SEO metadata ready — Title: \"{metadata.get('title', 'N/A')[:50]}...\"")
     logger.info(f"Tags: {len(metadata.get('tags', []))} | Chapters: {len(metadata.get('chapters', []))}")
 
@@ -255,13 +274,14 @@ async def run_pipeline() -> None:
     logger.info(f"Scheduled publish time: {publish_time.isoformat()}")
 
     try:
-        upload_result = await publisher.upload_video(
-            video_path=main_video_path,
-            thumbnail_path=thumbnail_path,
-            metadata=metadata,
-            publish_at=publish_time,
-            shorts_path=shorts_path,
-        )
+        async with StepSpinner(12, 13, "Uploading to YouTube", pipeline_start):
+            upload_result = await publisher.upload_video(
+                video_path=main_video_path,
+                thumbnail_path=thumbnail_path,
+                metadata=metadata,
+                publish_at=publish_time,
+                shorts_path=shorts_path,
+            )
 
         video_id = upload_result.get("video_id", "unknown")
         shorts_id = upload_result.get("shorts_id")
@@ -272,10 +292,8 @@ async def run_pipeline() -> None:
         if shorts_id:
             logger.info(f"🎉 Shorts uploaded: {shorts_url}")
 
-        # Notify via Telegram
         await notifier.send_success_notification(video_id, shorts_id)
 
-        # Print success to terminal
         print("\n" + "=" * 72)
         print("  🎉  UPLOAD SUCCESSFUL!")
         print("=" * 72)
