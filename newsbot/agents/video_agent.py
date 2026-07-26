@@ -149,7 +149,7 @@ class VideoAgent:
                 final_clips.append(intro_clip)
                 # Need to resize?
                 if intro_clip.w != 1920 or intro_clip.h != 1080:
-                    intro_clip = intro_clip.resize(newsize=(1920, 1080))
+                    intro_clip = intro_clip.resized(new_size=(1920, 1080))
             
             # 4. Script segments
             segments = script.get("segments", [])
@@ -173,17 +173,27 @@ class VideoAgent:
                     clips_to_close.append(clip)
                 
                 # Loop/trim and resize
-                clip = self._loop_clip_to_duration(clip, dur)
-                if clip.w != 1920 or clip.h != 1080:
-                    clip = clip.resize(newsize=(1920, 1080))
-                
-                # Lower third
-                lt_clip = self._create_lower_third(seg_name, dur, (1920, 1080))
-                clips_to_close.append(lt_clip)
-                
-                comp = CompositeVideoClip([clip, lt_clip])
-                segment_clips.append(comp)
-            
+                def _loop_clip_to_duration(self, clip, target_duration: float):
+                 """Loop or trim a clip to exactly target_duration (MoviePy 2.x)."""
+
+                # Trim if clip is longer
+                if clip.duration >= target_duration:
+                    return clip.subclipped(0, target_duration)
+
+                # Otherwise repeat the clip until long enough
+                    loops = []
+                    remaining = target_duration
+
+                while remaining > 0:
+                    if remaining >= clip.duration:
+                        loops.append(clip)
+                        remaining -= clip.duration
+                    else:
+                        loops.append(clip.subclipped(0, remaining))
+                        remaining = 0
+
+                return concatenate_videoclips(loops, method="compose")
+    
             # 5. Outro
             outro_path = self.config.ASSETS_DIR / "outro.mp4"
             outro_clip_obj = None
@@ -191,13 +201,13 @@ class VideoAgent:
                 outro_clip_obj = VideoFileClip(str(outro_path))
                 clips_to_close.append(outro_clip_obj)
                 if outro_clip_obj.w != 1920 or outro_clip_obj.h != 1080:
-                    outro_clip_obj = outro_clip_obj.resize(newsize=(1920, 1080))
+                    outro_clip_obj = outro_clip_obj.resized(newsize=(1920, 1080))
             
             # Combine segments
             if segment_clips:
                 main_video = concatenate_videoclips(segment_clips, method="compose")
                 # 7. Set voiceover audio
-                main_video = main_video.set_audio(voiceover_clip)
+                main_video = main_video.with_audio(voiceover_clip)
                 final_clips.append(main_video)
             
             if outro_clip_obj:
@@ -214,12 +224,12 @@ class VideoAgent:
                 if hasattr(afx, "audio_loop"):
                     bg_music = bg_music.fx(afx.audio_loop, duration=full_video.duration)
                 else:
-                    bg_music = bg_music.set_duration(full_video.duration)
+                    bg_music = bg_music.with_duration(full_video.duration)
                 
                 bg_music = bg_music.volumex(self.config.MUSIC_VOLUME)
                 
                 mixed_audio = CompositeAudioClip([full_video.audio, bg_music])
-                full_video = full_video.set_audio(mixed_audio)
+                full_video = full_video.with_audio(mixed_audio)
             
             # 9. Burn captions
             if captions_srt.exists():
@@ -284,8 +294,8 @@ class VideoAgent:
         bar_y = h - bar_height - 50
         
         # Background bar
-        bg = ColorClip(size=(w, bar_height), color=(20, 20, 20)).set_opacity(0.8)
-        bg = bg.set_duration(duration).set_position((0, bar_y))
+        bg = ColorClip(size=(w, bar_height), color=(20, 20, 20)).with_opacity(0.8)
+        bg = bg.with_duration(duration).with_position((0, bar_y))
         
         # Text
         try:
@@ -293,9 +303,9 @@ class VideoAgent:
         except Exception:
             txt = TextClip(text, fontsize=60, color='white')
             
-        txt = txt.set_duration(duration).set_position((50, bar_y + (bar_height - txt.h) // 2))
+        txt = txt.with_duration(duration).with_position((50, bar_y + (bar_height - txt.h) // 2))
         
-        return CompositeVideoClip([bg, txt], size=video_size).set_duration(duration)
+        return CompositeVideoClip([bg, txt], size=video_size).with_duration(duration)
 
     def _loop_clip_to_duration(self, clip, target_duration: float):
         """Loop a video clip to fill target_duration."""
@@ -343,7 +353,7 @@ class VideoAgent:
                 # Fallback if specific kwargs fail
                 txt = TextClip(cap["text"], fontsize=48, color='white')
                 
-            txt = txt.set_duration(duration).set_position(('center', h * 0.85)).set_start(start_t)
+            txt = txt.with_duration(duration).with_position(('center', h * 0.85)).with_start(start_t)
             text_clips.append(txt)
             
         return CompositeVideoClip([video] + text_clips)
