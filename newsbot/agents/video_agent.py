@@ -2,6 +2,8 @@ import logging
 import asyncio
 import aiohttp
 import re
+import shutil
+import subprocess
 from pathlib import Path
 import os
 import concurrent.futures
@@ -27,22 +29,26 @@ from config import Config
 
 logger = logging.getLogger(__name__)
 
+
 class VideoAgent:
     def __init__(self, config: Config):
         self.config = config
         self.pexels_headers = {"Authorization": config.PEXELS_API_KEY}
-    
-        async def fetch_broll(self, keywords: List[str], temp_dir: Path) -> List[Path]:
-            """
-            Fetch b-roll for all keywords CONCURRENTLY instead of sequentially.
-            A semaphore caps how many keyword-searches run in parallel, so we
-            respect Pexels' rate limit while still cutting total wall-clock time
-            dramatically versus doing one keyword at a time.
-            """
+        # Detect once per-process instead of once per render.
+        self._nvenc_available = self._check_nvenc_available()
+
+    # ── B-roll fetch (concurrent, local download, capped at 1080p) ────────
+
+    async def fetch_broll(self, keywords: List[str], temp_dir: Path) -> List[Path]:
+        """
+        Fetch b-roll for all keywords CONCURRENTLY instead of sequentially.
+        A semaphore caps how many keyword-searches run in parallel, so we
+        respect Pexels' rate limit while still cutting total wall-clock time
+        dramatically versus doing one keyword at a time.
+        """
         temp_dir.mkdir(parents=True, exist_ok=True)
 
         # Tune this: higher = faster, but more simultaneous connections/requests.
-        # 4-5 concurrent keyword searches is a safe, fast default for Pexels' free tier.
         MAX_CONCURRENT_KEYWORDS = 5
         semaphore = asyncio.Semaphore(MAX_CONCURRENT_KEYWORDS)
 
@@ -60,7 +66,6 @@ class VideoAgent:
                         session, keyword, temp_dir, overall
                     )
 
-            # Launch all keyword searches at once; semaphore throttles actual concurrency
             results = await asyncio.gather(
                 *[_process_keyword(kw) for kw in keywords],
                 return_exceptions=True,
@@ -76,7 +81,6 @@ class VideoAgent:
         overall.finish(f"{len(downloaded_paths)} b-roll clips downloaded")
         return downloaded_paths
 
-
     async def _fetch_broll_for_keyword(
         self,
         session: aiohttp.ClientSession,
@@ -89,10 +93,10 @@ class VideoAgent:
         if not keyword_slug:
             return []
 
-
-        best_file = self._select_best_broll_file(video_files)
-        if not best_file:
-            link = best_file.get("link")
+        url = (
+            f"https://api.pexels.com/videos/search"
+            f"?query={keyword}&per_page=15&min_duration=5&max_duration=30&orientation=landscape"
+        )
 
         try:
             logger.info(f"Searching Pexels for b-roll: '{keyword}'")
@@ -121,16 +125,9 @@ class VideoAgent:
             if not video_files:
                 continue
 
-            video_files = sorted(
-                video_files,
-                key=lambda x: (x.get("width", 0) * x.get("height", 0)),
-                reverse=True,
-            )
-            best_file = video_files[0]
-            for vf in video_files:
-                if vf.get("width", 0) >= 1920 and vf.get("height", 0) >= 1080:
-                    best_file = vf
-                    break
+            best_file = self._select_best_broll_file(video_files)
+            if not best_file:
+                continue
 
             download_link = best_file.get("link")
             if not download_link:
@@ -157,6 +154,79 @@ class VideoAgent:
 
         return downloaded
 
+    def _select_best_broll_file(self, video_files: List[dict]) -> Optional[dict]:
+        """
+        Pick the best b-roll source file: prefer files at or under 1080p,
+        and among those prefer an exact 1920x1080 (16:9) match so
+        _force_1080p can skip its resize+crop pass entirely.
+        """
+        candidates = [
+            vf for vf in video_files
+            if vf.get("width", 0) <= 1920 and vf.get("height", 0) <= 1080
+        ]
+        if not candidates:
+            # Nothing at/under 1080p — fall back to the smallest available file.
+            candidates = sorted(video_files, key=lambda x: x.get("width", 0) * x.get("height", 0))
+            return candidates[0] if candidates else None
+
+        # Prefer exact 1920x1080 first, then largest-area among the rest —
+        # avoids a resize+crop pass later in _force_1080p.
+        def score(vf):
+            w, h = vf.get("width", 0), vf.get("height", 0)
+            exact = 1 if (w, h) == (1920, 1080) else 0
+            return (exact, w * h)
+
+        candidates.sort(key=score, reverse=True)
+        return candidates[0]
+
+    # ── Encoding helpers ─────────────────────────────────────────────────
+
+    def _check_nvenc_available(self) -> bool:
+        """Check once whether ffmpeg has h264_nvenc support (NVIDIA GPU encode)."""
+        ffmpeg_bin = shutil.which("ffmpeg") or "ffmpeg"
+        try:
+            result = subprocess.run(
+                [ffmpeg_bin, "-hide_banner", "-encoders"],
+                capture_output=True, text=True, timeout=10,
+            )
+            available = "h264_nvenc" in result.stdout
+        except Exception as e:
+            logger.debug(f"Could not probe ffmpeg encoders (assuming no nvenc): {e}")
+            available = False
+
+        logger.info(f"h264_nvenc GPU encoding {'available' if available else 'not available'}")
+        return available
+
+    def _write_video_kwargs(self) -> Dict:
+        """
+        Build the write_videofile kwargs: GPU-accelerated nvenc when available,
+        otherwise a fast CPU libx264 fallback. Progress bar logger is only
+        enabled when NEWSSPHERE_DEBUG is set, since it writes to stdout every
+        frame and is pure overhead on unattended/automated runs.
+        """
+        common = {
+            "fps": self.config.VIDEO_FPS,
+            "audio_codec": "aac",
+            "threads": os.cpu_count(),
+            "logger": "bar" if os.environ.get("NEWSSPHERE_DEBUG") else None,
+        }
+
+        if self._nvenc_available:
+            return {
+                **common,
+                "codec": "h264_nvenc",
+                "preset": "p4",  # nvenc presets: p1 (fastest) .. p7 (slowest/best quality)
+            }
+
+        return {
+            **common,
+            "codec": "libx264",
+            "preset": "ultrafast",
+            "ffmpeg_params": ["-crf", "20"],
+        }
+
+    # ── Video assembly ──────────────────────────────────────────────────
+
     def _assemble_video_sync(
         self,
         voiceover_path: Path,
@@ -174,14 +244,15 @@ class VideoAgent:
             total_duration = voiceover_clip.duration
 
             final_clips = []
-            
-           # 3. Intro
+
+            # 3. Intro
+            intro_duration = 0.0
             intro_path = self.config.ASSETS_DIR / "intro.mp4"
             if intro_path.exists():
                 intro_clip = VideoFileClip(str(intro_path))
                 clips_to_close.append(intro_clip)
-                if intro_clip.w != 1920 or intro_clip.h != 1080:
-                    intro_clip = intro_clip.resized(new_size=(1920, 1080))
+                intro_clip = self._force_1080p(intro_clip)
+                intro_duration = intro_clip.duration
                 final_clips.append(intro_clip)
 
             # 4. Script segments
@@ -216,22 +287,28 @@ class VideoAgent:
             if outro_path.exists():
                 outro_clip_obj = VideoFileClip(str(outro_path))
                 clips_to_close.append(outro_clip_obj)
-                if outro_clip_obj.w != 1920 or outro_clip_obj.h != 1080:
-                    outro_clip_obj = outro_clip_obj.resized(new_size=(1920, 1080))
-            
-            # Combine segments
+                outro_clip_obj = self._force_1080p(outro_clip_obj)
+
+            # Combine segments.
+            # "chain" instead of "compose": every clip here has already been
+            # forced to exactly 1920x1080 above, so there's no need to pay
+            # for compose's per-frame canvas recompute/blit — chain just
+            # concatenates the same-sized clips directly.
             if segment_clips:
-                main_video = concatenate_videoclips(segment_clips, method="compose")
-                # 7. Set voiceover audio
+                main_video = concatenate_videoclips(segment_clips, method="chain")
                 main_video = main_video.with_audio(voiceover_clip)
                 final_clips.append(main_video)
-            
+
             if outro_clip_obj:
                 final_clips.append(outro_clip_obj)
-            
-            # 6. Concatenate all
-            full_video = concatenate_videoclips(final_clips, method="compose")
-            
+
+            full_video = concatenate_videoclips(final_clips, method="chain")
+
+            # Safety net: never allow the composited canvas to exceed 1080p
+            if full_video.w != 1920 or full_video.h != 1080:
+                logger.warning(f"full_video was {full_video.w}x{full_video.h}, forcing 1920x1080")
+                full_video = self._force_1080p(full_video)
+
             # 8. Add background music if provided
             if music_path and music_path.exists():
                 bg_music = AudioFileClip(str(music_path))
@@ -240,34 +317,36 @@ class VideoAgent:
                 # Loop music to match full video length
                 bg_music = bg_music.with_effects([afx.AudioLoop(duration=full_video.duration)])
 
-                # Scale volume (replaces v1 volumex)
+                # Scale volume
                 bg_music = bg_music.with_effects([afx.MultiplyVolume(self.config.MUSIC_VOLUME)])
 
                 mixed_audio = CompositeAudioClip([full_video.audio, bg_music])
                 full_video = full_video.with_audio(mixed_audio)
-            
+
             # 9. Burn captions
             if captions_srt.exists():
-                full_video = self._burn_captions(full_video, captions_srt)
-            
-            # 10. Export
+                full_video = self._burn_captions(full_video, captions_srt, offset=intro_duration)
+
+            # 10. Export — GPU (nvenc) when available, else fast libx264 fallback.
             output_path.parent.mkdir(parents=True, exist_ok=True)
-            full_video.write_videofile(
-                str(output_path),
-                fps=self.config.VIDEO_FPS,
-                codec="libx264",
-                audio_codec="aac",
-                preset="veryfast",
-                threads=os.cpu_count(),
-                logger="bar"
-            )
-            
+            write_kwargs = self._write_video_kwargs()
+            try:
+                full_video.write_videofile(str(output_path), **write_kwargs)
+            except Exception as e:
+                if write_kwargs.get("codec") == "h264_nvenc":
+                    logger.warning(f"nvenc encode failed ({e}), falling back to libx264")
+                    self._nvenc_available = False
+                    fallback_kwargs = self._write_video_kwargs()
+                    full_video.write_videofile(str(output_path), **fallback_kwargs)
+                else:
+                    raise
+
             # 11. Log output size
             size_mb = os.path.getsize(output_path) / (1024 * 1024)
             logger.info(f"Rendered video {output_path.name} - Size: {size_mb:.2f} MB")
-            
+
             return output_path
-            
+
         finally:
             for c in clips_to_close:
                 try:
@@ -302,25 +381,51 @@ class VideoAgent:
                 music_path
             )
 
+    # ── Sizing helper ────────────────────────────────────────────────────
+
+    def _force_1080p(self, clip):
+        """
+        Always force a clip to exactly 1920x1080, regardless of source
+        resolution — resize to cover, then center-crop any overflow.
+        Prevents any oversized (e.g. 4K) source from ballooning the
+        final composite canvas and causing OOM during rendering.
+        """
+        target_w, target_h = 1920, 1080
+        if clip.w == target_w and clip.h == target_h:
+            return clip
+
+        scale = max(target_w / clip.w, target_h / clip.h)
+        new_w, new_h = int(clip.w * scale), int(clip.h * scale)
+        clip = clip.resized(new_size=(new_w, new_h))
+
+        if clip.w != target_w or clip.h != target_h:
+            x_center = clip.w / 2
+            y_center = clip.h / 2
+            clip = clip.cropped(
+                x_center=x_center, y_center=y_center,
+                width=target_w, height=target_h,
+            )
+        return clip
+
+    # ── Text overlays ────────────────────────────────────────────────────
+
     def _create_lower_third(self, text: str, duration: float, video_size: Tuple[int, int]) -> 'CompositeVideoClip':
         """Create a lower-third text overlay."""
         w, h = video_size
         bar_height = int(h * 0.15)
         bar_y = h - bar_height - 50
-        
-        # Background bar
+
         bg = ColorClip(size=(w, bar_height), color=(20, 20, 20)).with_opacity(0.8)
         bg = bg.with_duration(duration).with_position((0, bar_y))
-        
-        # Text
+
         font_path = r"C:\Windows\Fonts\arialbd.ttf"
         try:
             txt = TextClip(font=font_path, text=text, font_size=60, color='white', horizontal_align='left')
         except Exception:
             txt = TextClip(font=font_path, text=text, font_size=60, color='white')
-            
+
         txt = txt.with_duration(duration).with_position((50, bar_y + (bar_height - txt.h) // 2))
-        
+
         return CompositeVideoClip([bg, txt], size=video_size).with_duration(duration)
 
     def _loop_clip_to_duration(self, clip, target_duration: float):
@@ -340,8 +445,10 @@ class VideoAgent:
 
         return concatenate_videoclips(loops, method="compose")
 
-    def _burn_captions(self, video, srt_path: Path):
-        """Parse SRT file and burn captions onto video."""
+    def _burn_captions(self, video, srt_path: Path, offset: float = 0.0):
+        """Parse SRT file and burn captions onto video, shifted by `offset`
+        seconds so they line up with where the voiceover actually starts
+        in the final timeline (e.g. after an intro clip)."""
         captions = self._parse_srt(srt_path)
         if not captions:
             return video
@@ -351,8 +458,8 @@ class VideoAgent:
 
         text_clips = []
         for cap in captions:
-            start_t = self._srt_time_to_seconds(cap["start"])
-            end_t = self._srt_time_to_seconds(cap["end"])
+            start_t = self._srt_time_to_seconds(cap["start"]) + offset
+            end_t = self._srt_time_to_seconds(cap["end"]) + offset
             duration = end_t - start_t
 
             if duration <= 0:
@@ -384,7 +491,7 @@ class VideoAgent:
         content = srt_path.read_text(encoding="utf-8")
         blocks = content.strip().split("\n\n")
         captions = []
-        
+
         for block in blocks:
             lines = block.split("\n")
             if len(lines) >= 3:
@@ -399,7 +506,7 @@ class VideoAgent:
                         "text": text
                     })
         return captions
-        
+
     def _srt_time_to_seconds(self, time_str: str) -> float:
         """Convert SRT timestamp 'HH:MM:SS,mmm' to float seconds."""
         time_str = time_str.replace(',', '.')
