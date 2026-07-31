@@ -4,6 +4,7 @@ import aiohttp
 import re
 import shutil
 import subprocess
+import imageio_ffmpeg
 from pathlib import Path
 import os
 import concurrent.futures
@@ -48,7 +49,6 @@ class VideoAgent:
         """
         temp_dir.mkdir(parents=True, exist_ok=True)
 
-        # Tune this: higher = faster, but more simultaneous connections/requests.
         MAX_CONCURRENT_KEYWORDS = 5
         semaphore = asyncio.Semaphore(MAX_CONCURRENT_KEYWORDS)
 
@@ -165,12 +165,9 @@ class VideoAgent:
             if vf.get("width", 0) <= 1920 and vf.get("height", 0) <= 1080
         ]
         if not candidates:
-            # Nothing at/under 1080p — fall back to the smallest available file.
             candidates = sorted(video_files, key=lambda x: x.get("width", 0) * x.get("height", 0))
             return candidates[0] if candidates else None
 
-        # Prefer exact 1920x1080 first, then largest-area among the rest —
-        # avoids a resize+crop pass later in _force_1080p.
         def score(vf):
             w, h = vf.get("width", 0), vf.get("height", 0)
             exact = 1 if (w, h) == (1920, 1080) else 0
@@ -183,7 +180,7 @@ class VideoAgent:
 
     def _check_nvenc_available(self) -> bool:
         """Check once whether ffmpeg has h264_nvenc support (NVIDIA GPU encode)."""
-        ffmpeg_bin = shutil.which("ffmpeg") or "ffmpeg"
+        ffmpeg_bin = shutil.which("ffmpeg") or imageio_ffmpeg.get_ffmpeg_exe()
         try:
             result = subprocess.run(
                 [ffmpeg_bin, "-hide_banner", "-encoders"],
@@ -196,6 +193,82 @@ class VideoAgent:
 
         logger.info(f"h264_nvenc GPU encoding {'available' if available else 'not available'}")
         return available
+
+    def _burn_captions_ffmpeg(self, input_path: Path, srt_path: Path, output_path: Path) -> None:
+        """
+        Burn captions using ffmpeg's native subtitles filter — a single fast
+        pass instead of MoviePy compositing hundreds of per-frame TextClip
+        masks in Python. This is the single biggest speed win in the pipeline.
+        """
+        ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+
+        srt_filter_path = str(srt_path).replace("\\", "/").replace(":", "\\:")
+
+        style = (
+            "FontName=Arial,FontSize=13,PrimaryColour=&HFFFFFF&,"
+            "OutlineColour=&H000000&,BorderStyle=1,Outline=2,"
+            "Alignment=2,MarginV=60"
+        )
+
+        cmd = [
+            ffmpeg_exe, "-y",
+            "-i", str(input_path),
+            "-vf", f"subtitles='{srt_filter_path}':force_style='{style}'",
+            "-c:v", "libx264",
+            "-preset", "veryfast",
+            "-c:a", "copy",
+            str(output_path),
+        ]
+
+        logger.info("Burning captions via ffmpeg (fast path)...")
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            logger.error(f"ffmpeg caption burn failed: {result.stderr[-2000:]}")
+            raise RuntimeError("ffmpeg caption burn failed")
+
+    def _write_offset_srt(self, srt_path: Path, offset: float, dest_path: Path) -> Path:
+        """
+        Write a copy of an SRT file with every timestamp shifted by `offset`
+        seconds. Used so captions (generated against the voiceover alone,
+        starting at t=0) line up correctly once an intro clip has been
+        prepended to the final video.
+        """
+        if offset <= 0:
+            return srt_path
+
+        captions = self._parse_srt(srt_path)
+        lines = []
+        for cap in captions:
+            start_t = self._srt_time_to_seconds(cap["start"]) + offset
+            end_t = self._srt_time_to_seconds(cap["end"]) + offset
+            lines.append(cap["index"])
+            lines.append(f"{self._format_timestamp(start_t)} --> {self._format_timestamp(end_t)}")
+            lines.append(cap["text"])
+            lines.append("")
+
+        dest_path.write_text("\n".join(lines), encoding="utf-8")
+        return dest_path
+
+    def _format_timestamp(self, seconds: float) -> str:
+        """Convert seconds to SRT timestamp format: HH:MM:SS,mmm"""
+        if seconds < 0:
+            seconds = 0.0
+        hours = int(seconds // 3600)
+        minutes = int((seconds % 3600) // 60)
+        secs = int(seconds % 60)
+        millis = int(round((seconds - int(seconds)) * 1000))
+
+        if millis == 1000:
+            millis = 0
+            secs += 1
+            if secs == 60:
+                secs = 0
+                minutes += 1
+                if minutes == 60:
+                    minutes = 0
+                    hours += 1
+
+        return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
 
     def _write_video_kwargs(self) -> Dict:
         """
@@ -275,7 +348,6 @@ class VideoAgent:
                     clip = ColorClip(size=(1920, 1080), color=(0, 0, 0), duration=dur)
                     clips_to_close.append(clip)
 
-                # Loop/trim to the segment's target duration, then force exact 1080p
                 clip = self._loop_clip_to_duration(clip, dur)
                 clip = self._force_1080p(clip)
 
@@ -289,11 +361,8 @@ class VideoAgent:
                 clips_to_close.append(outro_clip_obj)
                 outro_clip_obj = self._force_1080p(outro_clip_obj)
 
-            # Combine segments.
-            # "chain" instead of "compose": every clip here has already been
-            # forced to exactly 1920x1080 above, so there's no need to pay
-            # for compose's per-frame canvas recompute/blit — chain just
-            # concatenates the same-sized clips directly.
+            # Combine segments — "chain" is much cheaper than "compose" since
+            # every clip here is already forced to exactly 1920x1080.
             if segment_clips:
                 main_video = concatenate_videoclips(segment_clips, method="chain")
                 main_video = main_video.with_audio(voiceover_clip)
@@ -304,7 +373,6 @@ class VideoAgent:
 
             full_video = concatenate_videoclips(final_clips, method="chain")
 
-            # Safety net: never allow the composited canvas to exceed 1080p
             if full_video.w != 1920 or full_video.h != 1080:
                 logger.warning(f"full_video was {full_video.w}x{full_video.h}, forcing 1920x1080")
                 full_video = self._force_1080p(full_video)
@@ -313,33 +381,39 @@ class VideoAgent:
             if music_path and music_path.exists():
                 bg_music = AudioFileClip(str(music_path))
                 clips_to_close.append(bg_music)
-
-                # Loop music to match full video length
                 bg_music = bg_music.with_effects([afx.AudioLoop(duration=full_video.duration)])
-
-                # Scale volume
                 bg_music = bg_music.with_effects([afx.MultiplyVolume(self.config.MUSIC_VOLUME)])
-
                 mixed_audio = CompositeAudioClip([full_video.audio, bg_music])
                 full_video = full_video.with_audio(mixed_audio)
 
-            # 9. Burn captions
-            if captions_srt.exists():
-                full_video = self._burn_captions(full_video, captions_srt, offset=intro_duration)
-
             # 10. Export — GPU (nvenc) when available, else fast libx264 fallback.
+            # Rendered WITHOUT captions here; captions are burned in a fast
+            # separate ffmpeg pass below instead of via MoviePy compositing.
             output_path.parent.mkdir(parents=True, exist_ok=True)
+            no_captions_path = output_path.with_name(output_path.stem + "_nocaps.mp4")
             write_kwargs = self._write_video_kwargs()
             try:
-                full_video.write_videofile(str(output_path), **write_kwargs)
+                full_video.write_videofile(str(no_captions_path), **write_kwargs)
             except Exception as e:
                 if write_kwargs.get("codec") == "h264_nvenc":
                     logger.warning(f"nvenc encode failed ({e}), falling back to libx264")
                     self._nvenc_available = False
                     fallback_kwargs = self._write_video_kwargs()
-                    full_video.write_videofile(str(output_path), **fallback_kwargs)
+                    full_video.write_videofile(str(no_captions_path), **fallback_kwargs)
                 else:
                     raise
+
+            # 10b. Burn captions via ffmpeg (fast path), shifted to account
+            # for the intro's duration, then clean up intermediate files.
+            if captions_srt.exists():
+                offset_srt_path = no_captions_path.with_name(no_captions_path.stem + "_offset.srt")
+                srt_to_burn = self._write_offset_srt(captions_srt, intro_duration, offset_srt_path)
+                self._burn_captions_ffmpeg(no_captions_path, srt_to_burn, output_path)
+                no_captions_path.unlink(missing_ok=True)
+                if srt_to_burn != captions_srt:
+                    srt_to_burn.unlink(missing_ok=True)
+            else:
+                no_captions_path.rename(output_path)
 
             # 11. Log output size
             size_mb = os.path.getsize(output_path) / (1024 * 1024)
@@ -444,47 +518,6 @@ class VideoAgent:
                 remaining = 0
 
         return concatenate_videoclips(loops, method="compose")
-
-    def _burn_captions(self, video, srt_path: Path, offset: float = 0.0):
-        """Parse SRT file and burn captions onto video, shifted by `offset`
-        seconds so they line up with where the voiceover actually starts
-        in the final timeline (e.g. after an intro clip)."""
-        captions = self._parse_srt(srt_path)
-        if not captions:
-            return video
-
-        w, h = video.w, video.h
-        font_path = r"C:\Windows\Fonts\arialbd.ttf"
-
-        text_clips = []
-        for cap in captions:
-            start_t = self._srt_time_to_seconds(cap["start"]) + offset
-            end_t = self._srt_time_to_seconds(cap["end"]) + offset
-            duration = end_t - start_t
-
-            if duration <= 0:
-                continue
-
-            try:
-                txt = TextClip(
-                    font=font_path,
-                    text=cap["text"],
-                    font_size=48,
-                    color='white',
-                    stroke_color='black',
-                    stroke_width=2,
-                    method='caption',
-                    size=(int(w * 0.8), None),
-                    text_align='center',
-                )
-            except Exception as e:
-                logger.warning(f"TextClip styled render failed ({e}), falling back to plain text")
-                txt = TextClip(font=font_path, text=cap["text"], font_size=48, color='white')
-
-            txt = txt.with_duration(duration).with_position(('center', h * 0.85)).with_start(start_t)
-            text_clips.append(txt)
-
-        return CompositeVideoClip([video] + text_clips)
 
     def _parse_srt(self, srt_path: Path) -> List[Dict]:
         """Parse an SRT file into list of {index, start, end, text} dicts."""

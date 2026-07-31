@@ -187,10 +187,9 @@ async def run_pipeline() -> None:
 
     # ── 7. Fetch b-roll + assemble video ────────────────────────────────
     logger.info("Step 7/13: Fetching b-roll from Pexels + assembling video...")
-    # ── 7. Assemble video (b-roll fetch has its own bars already) ──────
     video_agent = VideoAgent(config)
     broll_keywords = script.get("broll_keywords", [])
-    broll_paths = await video_agent.fetch_broll(broll_keywords)  # now returns URLs, not file paths
+    broll_paths = await video_agent.fetch_broll(broll_keywords, temp_dir)
 
     music_path = file_mgr.get_music_file()
     if music_path:
@@ -208,24 +207,8 @@ async def run_pipeline() -> None:
             output_path=main_video_path,
             music_path=music_path,
         )
-        
+
     logger.info(f"Downloaded {len(broll_paths)} b-roll clips.")
-
-    music_path = file_mgr.get_music_file()
-    if music_path:
-        logger.info(f"Background music: {music_path.name}")
-    else:
-        logger.info("No background music found in assets/music/ — skipping.")
-
-    main_video_path = file_mgr.generate_output_path(headline, "main", "mp4")
-    await video_agent.assemble_video(
-        voiceover_path=audio_path,
-        broll_paths=broll_paths,
-        script=script,
-        captions_srt=captions_srt_path,
-        output_path=main_video_path,
-        music_path=music_path,
-    )
     logger.info(f"Main video assembled: {main_video_path.name}")
     file_mgr.log_file_size(main_video_path)
 

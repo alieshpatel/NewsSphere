@@ -30,6 +30,7 @@ htmlcov/
 .tox/
 .nox/
 output
+token.json
 
 # Jupyter
 .ipynb_checkpoints/
